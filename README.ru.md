@@ -20,7 +20,8 @@
 * **Context** — `dict`, общий для всех шагов одного прогона: шаг кладёт туда
   свои результаты и читает результаты предыдущих шагов.
 * **OnError** — политика обработки отказа, задаваемая в момент вызова:
-  `ABORT`, `CONTINUE` или `ROLLBACK`, плюс `retries` и `retry_delay`.
+  `ABORT`, `CONTINUE` или `ROLLBACK`, плюс `retries`, `retry_delay` и
+  `step_timeout`.
 
 ## Файлы
 
@@ -68,11 +69,14 @@ class SecureDispatch(Checklist):
 from vault import build_bundle
 
 build_bundle({"connect": ConnectToServer,
-              "secure_dispatch": SecureDispatch}, key, "secure_bundle.py")
+              "secure_dispatch": SecureDispatch}, key, "secure_bundle.py",
+             version=3)
 ```
 
 На выходе — импортируемый `.py` со словарём `{имя: base64_шифротекст}`.
-Исходного кода в нём нет.
+Исходного кода в нём нет. Поднимайте `version` на каждом релизе: устройство
+откажет всему, что старше. Файл пишется во временный и переименовывается на
+место, поэтому прерванная сборка никогда не заменит рабочий бандл обрубком.
 
 **3. Загружаем и запускаем** на устройстве:
 
@@ -81,9 +85,11 @@ from engine import ChecklistRunner
 from vault import load_bundle
 from contracts import OnError
 
-runner = ChecklistRunner(load_bundle("secure_bundle.py", key))
+runner = ChecklistRunner(load_bundle("secure_bundle.py", key,
+                                     min_version=3))
 report = runner.run("secure_dispatch",
-                    on_error=OnError(OnError.ROLLBACK, retries=2))
+                    on_error=OnError(OnError.ROLLBACK, retries=2,
+                                     step_timeout=10))
 print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
 ```
 
@@ -108,10 +114,34 @@ print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
 `.rolled_back`, `.duration`, `.summary()`). Политика, переданная в `run()`,
 перекрывает объявленную в самом чек-листе.
 
+### Таймауты шага
+
+`step_timeout` ограничивает одну *попытку*, а не шаг целиком: при `retries=2`
+и `step_timeout=10` зависший шаг стоит максимум 30 с вместо вечной блокировки
+процедуры. При срабатывании внутри шага возбуждается `StepTimeout` и
+засчитывается как обычная неудачная попытка.
+
+Прерывание сделано через `SIGALRM`, поэтому реально работает только в главном
+потоке CPython под Unix; в остальных случаях движок пишет предупреждение, а
+лимит становится рекомендательным. Пишите блокирующие шаги так, чтобы они
+учитывали его в любом случае:
+
+```python
+def run(self, ctx, **_):
+    sock.settimeout(ctx.time_left())   # None, если таймаут не задан
+```
+
+Шаг, который ловит исключения широко, проглотит и `StepTimeout`.
+
 ## Криптография
 
 * **Шифр: AES-GCM-SIV** (RFC 8452). Имя записи привязано как associated data,
   поэтому шифротекст нельзя незаметно переставить в другой слот бандла.
+* **Манифест всего бандла.** Тег над форматом, шифром, меткой времени,
+  номером версии и дайджестом каждого шифротекста проверяется до того, как
+  что-либо расшифровано: добавленная, удалённая, подменённая или
+  переставленная запись — как и любая правка `META` — отвергается сразу, как
+  и неверный ключ.
 * **Вывод ключа** (`crypto.derive_key`) — Argon2id с `t=3` итерациями,
   `p=4` полосами, `m=2^16 KiB` (64 МиБ), выход 64 байта, затем
   HKDF-SHA3-512 до нужной длины. Аргумент `info` (по умолчанию
@@ -121,9 +151,11 @@ print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
   key = crypto.derive_key(passphrase, salt, info=b"my-fleet/v2")
   ```
 
-  Argon2id требует 64 МиБ ОЗУ на один вывод — убедитесь, что плата их
-  выделит. Соль (16 байт) храните рядом с бандлом; она не секретна, но должна
-  быть уникальной.
+  Argon2id требует 64 МиБ ОЗУ на один вывод. Плата, которая столько не даёт,
+  может передать `iterations`, `lanes` и `memory_kib` явно, приняв более
+  слабую стойкость к офлайн-перебору; все значения придётся повторить, чтобы
+  вывести тот же ключ. Соль (16 байт) храните рядом с бандлом; она не
+  секретна, но должна быть уникальной.
 * `encrypt`/`decrypt` принимают сырой ключ
   16/24/32 байта.
 
@@ -139,12 +171,27 @@ print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
 файла позволило бы любому, кто может в него писать, запустить код ещё до
 единственной проверки ключа.
 
+### Откат
+
+Манифест доказывает, что бандл цел, но не что он *актуален* — атакующий может
+вернуть на место более старый, честно подписанный бандл. Передавайте последнюю
+принятую устройством версию:
+
+```python
+registry = load_bundle("secure_bundle.py", key, min_version=stored_version)
+stored_version = registry.version      # сохраните её
+```
+
+Манифест несёт только форма с файлом (или модулем); загрузка голого словаря
+пропускает обе проверки, и `min_version` тогда возбуждает ошибку.
+
 ## Правила написания контрактов
 
 `inspect.getsource` захватывает только тело класса, но не строки `import` из
 модуля. Загрузчик заранее подставляет `Step`, `Checklist`, `Context`,
-`OnError`, `StepResult`, `ChecklistReport` и модули `time`, `os`, `json`,
-`struct`, `hashlib`, `hmac`, `binascii`, `math`, `random`. **Всё остальное
+`OnError`, `StepResult`, `StepTimeout`, `ChecklistReport` и модули `time`,
+`os`, `json`, `struct`, `hashlib`, `hmac`, `binascii`, `math`, `random`.
+**Всё остальное
 импортируйте внутри метода.** Каждая запись бандла должна определять ровно
 один подкласс `Step` или `Checklist`, и класс должен лежать в настоящем
 `.py`-файле.

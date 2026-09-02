@@ -10,7 +10,9 @@ For each step:
 1. Instantiate the step class and call ``run(ctx, **params)``.
 2. On exception, retry up to ``on_error.retries`` more times, sleeping
    ``retry_delay`` in between. The same instance is reused, so a step can
-   track its own attempts through the context.
+   track its own attempts through the context. An attempt that outruns
+   ``on_error.step_timeout`` is interrupted with
+   :class:`~contracts.StepTimeout` and counts as a failed attempt.
 3. If it still fails, apply the policy: ``ABORT`` stops immediately,
    ``CONTINUE`` moves on, ``ROLLBACK`` calls ``undo(ctx)`` on the
    already-completed steps in reverse order and then stops.
@@ -18,7 +20,10 @@ For each step:
 Every attempt is captured in a :class:`~contracts.ChecklistReport`.
 """
 
+import contextlib
 import logging
+import signal
+import threading
 import time
 
 from contracts import (
@@ -28,6 +33,7 @@ from contracts import (
     OnError,
     Step,
     StepResult,
+    StepTimeout,
 )
 
 __all__ = ["ChecklistRunner"]
@@ -45,6 +51,7 @@ class ChecklistRunner:
         """
         self._registry = registry
         self._log = logger or _LOG
+        self._warned_advisory_timeout = False
 
     def run(self, checklist, ctx=None, on_error=None):
         """Execute ``checklist``; return a
@@ -103,33 +110,41 @@ class ChecklistRunner:
         attempts = 0
         started = time.time()
         max_attempts = 1 + policy.retries
+        timeout = policy.step_timeout
         last_error = None
+        self._check_timeout_support(timeout)
 
-        while attempts < max_attempts:
-            attempts += 1
-            try:
-                self._log.info(
-                    "step %d %r attempt %d", index, step_name, attempts
+        try:
+            while attempts < max_attempts:
+                attempts += 1
+                self._set_deadline(ctx, timeout)
+                try:
+                    self._log.info(
+                        "step %d %r attempt %d", index, step_name, attempts
+                    )
+                    with _time_limit(timeout, step_name):
+                        value = step.run(ctx, **params)
+                except Exception as exc:
+                    last_error = exc
+                    self._log.warning(
+                        "step %r attempt %d failed: %r",
+                        step_name, attempts, exc
+                    )
+                    if attempts < max_attempts and policy.retry_delay:
+                        time.sleep(policy.retry_delay)
+                    continue
+                duration = time.time() - started
+                self._log.info("step %r ok in %.3fs", step_name, duration)
+                result = StepResult(
+                    step_name,
+                    StepResult.OK,
+                    value=value,
+                    attempts=attempts,
+                    duration=duration,
                 )
-                value = step.run(ctx, **params)
-            except Exception as exc:
-                last_error = exc
-                self._log.warning(
-                    "step %r attempt %d failed: %r", step_name, attempts, exc
-                )
-                if attempts < max_attempts and policy.retry_delay:
-                    time.sleep(policy.retry_delay)
-                continue
-            duration = time.time() - started
-            self._log.info("step %r ok in %.3fs", step_name, duration)
-            result = StepResult(
-                step_name,
-                StepResult.OK,
-                value=value,
-                attempts=attempts,
-                duration=duration,
-            )
-            return result, step
+                return result, step
+        finally:
+            self._set_deadline(ctx, None)
 
         result = StepResult(
             step_name,
@@ -139,6 +154,23 @@ class ChecklistRunner:
             duration=time.time() - started,
         )
         return result, step
+
+    def _check_timeout_support(self, timeout):
+        """Warn once if ``timeout`` cannot be enforced on this platform."""
+        if not timeout or _timeout_enforceable():
+            return
+        if not self._warned_advisory_timeout:
+            self._warned_advisory_timeout = True
+            self._log.warning(
+                "step_timeout is advisory here (no SIGALRM, or not the "
+                "main thread): steps must honour ctx.time_left()"
+            )
+
+    @staticmethod
+    def _set_deadline(ctx, timeout):
+        """Publish the current attempt's deadline on a :class:`Context`."""
+        if isinstance(ctx, Context):
+            ctx.deadline = time.time() + timeout if timeout else None
 
     def _load_step(self, step_name):
         """Resolve ``step_name`` to a fresh :class:`~contracts.Step`."""
@@ -193,6 +225,40 @@ class ChecklistRunner:
         if not (isinstance(cls, type) and issubclass(cls, Checklist)):
             raise TypeError("%r is not a Checklist subclass" % (cls,))
         return (cls.display_name(), _normalise_steps(cls.steps), cls.on_error)
+
+
+def _timeout_enforceable():
+    """Report whether a step attempt can actually be interrupted here."""
+    return (
+        hasattr(signal, "SIGALRM")
+        and threading.current_thread() is threading.main_thread()
+    )
+
+
+@contextlib.contextmanager
+def _time_limit(seconds, step_name):
+    """Raise :class:`~contracts.StepTimeout` in the body after ``seconds``.
+
+    Enforcement uses ``SIGALRM``, so it works only on the main thread of a
+    Unix CPython process. Everywhere else the limit is advisory and a step
+    is expected to honour :meth:`contracts.Context.time_left` itself.
+    """
+    if not seconds or not _timeout_enforceable():
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise StepTimeout(
+            "step %r exceeded its %.3fs limit" % (step_name, seconds)
+        )
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _normalise_steps(steps):

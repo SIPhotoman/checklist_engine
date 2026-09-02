@@ -22,10 +22,11 @@ import hashlib
 import hmac
 import logging
 import os
+import time
 
 from contracts import Checklist, OnError, Step
 from engine import ChecklistRunner
-from vault import build_bundle, load_bundle
+from vault import BundleError, build_bundle, load_bundle
 
 BUNDLE_PATH = "secure_bundle.py"
 
@@ -100,6 +101,17 @@ class SendCommand(Step):
         return {"command": command, "status": "acknowledged"}
 
 
+class StallForever(Step):
+    """A step that never returns on its own, to exercise step_timeout."""
+
+    name = "stall"
+
+    def run(self, ctx, seconds=3600.0, **_):
+        # SIMULATED: a socket read with no timeout of its own.
+        time.sleep(seconds)
+        return "returned on its own"
+
+
 class SecureDispatch(Checklist):
     """The canonical happy-path emergency procedure."""
 
@@ -118,8 +130,11 @@ SOURCES = {
     "channel": EstablishEncryptedChannel,
     "rotate_keys": RotateKeys,
     "send": SendCommand,
+    "stall": StallForever,
     "secure_dispatch": SecureDispatch,
 }
+
+BUNDLE_VERSION = 3
 
 
 # Demo driver.
@@ -132,11 +147,12 @@ def main():
     key = os.urandom(32)
 
     # 1. Offline: encrypt the plaintext classes into an importable bundle
-    build_bundle(SOURCES, key, BUNDLE_PATH)
-    print("built encrypted bundle -> %s\n" % BUNDLE_PATH)
+    build_bundle(SOURCES, key, BUNDLE_PATH, version=BUNDLE_VERSION)
+    print("built encrypted bundle v%d -> %s\n"
+          % (BUNDLE_VERSION, BUNDLE_PATH))
 
-    # 2. Runtime: load the bundle back with the key.
-    registry = load_bundle(BUNDLE_PATH, key)
+    # 2. Runtime: load it back, refusing anything older than we accepted.
+    registry = load_bundle(BUNDLE_PATH, key, min_version=BUNDLE_VERSION)
     runner = ChecklistRunner(registry)
     print("contracts in bundle:", registry.names(), "\n")
 
@@ -169,12 +185,28 @@ def main():
     )
     _dump(report)
 
-    # 3d. The key is the trust boundary: a wrong key yields no contracts.
-    print("=== run D: wrong key ===")
-    wrong = ChecklistRunner(load_bundle(BUNDLE_PATH, os.urandom(32)))
-    report = wrong.run([("connect", {})])
-    print(report.summary())
-    print("   ", report.results[0])
+    # 3d. A blocking step is interrupted instead of stalling the run.
+    print("=== run D: hung step, step_timeout ===")
+    report = runner.run(
+        [("stall", {})],
+        on_error=OnError(OnError.ABORT, retries=1, step_timeout=0.3),
+    )
+    _dump(report)
+
+    # 3e. The key is the trust boundary, checked before anything decrypts.
+    print("=== run E: wrong key ===")
+    try:
+        load_bundle(BUNDLE_PATH, key=os.urandom(32))
+    except BundleError as exc:
+        print("   refused at load time: %s\n" % exc)
+
+    # 3f. An older bundle cannot be put back once v3 has been accepted.
+    print("=== run F: rollback refused ===")
+    build_bundle(SOURCES, key, BUNDLE_PATH, version=BUNDLE_VERSION - 1)
+    try:
+        load_bundle(BUNDLE_PATH, key, min_version=BUNDLE_VERSION)
+    except BundleError as exc:
+        print("   refused at load time: %s" % exc)
 
 
 def _dump(report):

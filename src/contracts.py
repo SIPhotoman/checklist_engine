@@ -7,7 +7,7 @@ so step code can use ``Step``, ``Context`` and friends without importing.
 * **Step / contract** -- one atomic action.
 * **Checklist** -- an ordered plan of steps.
 * **Context** -- shared state threaded through one run.
-* **OnError** -- what to do when a step fails.
+* **OnError** -- what to do when a step fails, and how long to wait.
 """
 
 import time
@@ -18,8 +18,18 @@ __all__ = [
     "Checklist",
     "OnError",
     "StepResult",
+    "StepTimeout",
     "ChecklistReport",
 ]
+
+
+class StepTimeout(Exception):
+    """Raised inside a step whose attempt outran ``OnError.step_timeout``.
+
+    The engine treats it as an ordinary step failure, so retries and the
+    failure policy apply. A step that swallows broad exceptions will
+    swallow this one too.
+    """
 
 
 class Context(dict):
@@ -28,7 +38,12 @@ class Context(dict):
     A step publishes outputs here and reads inputs produced by earlier
     steps: ``ctx["channel"] = sock`` in one, ``ctx.require("channel")`` in
     the next. A plain ``dict`` subclass, so step code stays portable.
+
+    :attr:`deadline` is set by the engine around each step attempt; read
+    it through :meth:`time_left` rather than directly.
     """
+
+    deadline = None
 
     def require(self, key):
         """Return ``self[key]``, or raise a clear error if it is missing."""
@@ -37,6 +52,17 @@ class Context(dict):
                 "required context key %r was not set by a prior step" % key
             )
         return self[key]
+
+    def time_left(self):
+        """Seconds until the current step attempt times out, or ``None``.
+
+        A blocking step should pass this to whatever it waits on -- a
+        socket timeout, a poll interval -- because signal-based
+        enforcement is unavailable off the main thread and on Windows.
+        """
+        if self.deadline is None:
+            return None
+        return max(0.0, self.deadline - time.time())
 
 
 class Step:
@@ -124,11 +150,15 @@ class OnError:
 
     POLICIES = (ABORT, CONTINUE, ROLLBACK)
 
-    def __init__(self, policy=ABORT, retries=0, retry_delay=0.0):
+    def __init__(self, policy=ABORT, retries=0, retry_delay=0.0,
+                 step_timeout=None):
         """:param policy: one of :attr:`ABORT`, :attr:`CONTINUE`,
             :attr:`ROLLBACK`.
         :param retries: extra attempts per step before it is deemed failed.
         :param retry_delay: seconds to sleep between attempts.
+        :param step_timeout: seconds one *attempt* may run before
+            :class:`StepTimeout` is raised inside it; ``None`` waits
+            forever. The budget is per attempt, not per step.
         """
         if policy not in self.POLICIES:
             raise ValueError("unknown failure policy: %r" % (policy,))
@@ -136,15 +166,22 @@ class OnError:
             raise ValueError("retries must be >= 0")
         if retry_delay < 0:
             raise ValueError("retry_delay must be >= 0")
+        if step_timeout is not None and step_timeout <= 0:
+            raise ValueError("step_timeout must be > 0 or None")
         self.policy = policy
         self.retries = retries
         self.retry_delay = retry_delay
+        self.step_timeout = step_timeout
 
     def __repr__(self):
-        return "OnError(policy=%r, retries=%d, retry_delay=%s)" % (
-            self.policy,
-            self.retries,
-            self.retry_delay,
+        return (
+            "OnError(policy=%r, retries=%d, retry_delay=%s, "
+            "step_timeout=%s)" % (
+                self.policy,
+                self.retries,
+                self.retry_delay,
+                self.step_timeout,
+            )
         )
 
 

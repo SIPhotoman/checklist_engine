@@ -20,7 +20,7 @@ runtime by a device holding the key.
 * **Context** — a `dict` shared by every step of one run; steps publish
   outputs into it and read the outputs of earlier steps.
 * **OnError** — the call-time failure policy: `ABORT`, `CONTINUE` or
-  `ROLLBACK`, plus `retries` and `retry_delay`.
+  `ROLLBACK`, plus `retries`, `retry_delay` and `step_timeout`.
 
 ## Files
 
@@ -68,11 +68,15 @@ class SecureDispatch(Checklist):
 from vault import build_bundle
 
 build_bundle({"connect": ConnectToServer,
-              "secure_dispatch": SecureDispatch}, key, "secure_bundle.py")
+              "secure_dispatch": SecureDispatch}, key, "secure_bundle.py",
+             version=3)
 ```
 
 The result is an importable `.py` file holding `{name: base64_ciphertext}`.
-No source code appears in it.
+No source code appears in it. Raise `version` on every release: the device
+refuses anything older. The file is written to a temporary file and renamed
+into place, so an interrupted build never replaces a working bundle with a
+truncated one.
 
 **3. Load and run** on the device:
 
@@ -81,9 +85,11 @@ from engine import ChecklistRunner
 from vault import load_bundle
 from contracts import OnError
 
-runner = ChecklistRunner(load_bundle("secure_bundle.py", key))
+runner = ChecklistRunner(load_bundle("secure_bundle.py", key,
+                                     min_version=3))
 report = runner.run("secure_dispatch",
-                    on_error=OnError(OnError.ROLLBACK, retries=2))
+                    on_error=OnError(OnError.ROLLBACK, retries=2,
+                                     step_timeout=10))
 print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
 ```
 
@@ -107,10 +113,33 @@ Every attempt lands in a `ChecklistReport` (`.ok`, `.results`,
 `.rolled_back`, `.duration`, `.summary()`). A policy passed to `run()`
 overrides the one declared on the checklist.
 
+### Step timeouts
+
+`step_timeout` bounds one *attempt*, not the whole step: with `retries=2` and
+`step_timeout=10` a hung step costs at most 30 s instead of blocking the
+procedure forever. When it fires, `StepTimeout` is raised inside the step and
+counts as an ordinary failed attempt.
+
+Enforcement uses `SIGALRM`, so it only interrupts code running on the main
+thread of a Unix CPython process; elsewhere the runner logs a warning and the
+limit becomes advisory. Write blocking steps to honour it either way:
+
+```python
+def run(self, ctx, **_):
+    sock.settimeout(ctx.time_left())   # None when no timeout is set
+```
+
+A step that catches broad exceptions will swallow `StepTimeout` like any
+other.
+
 ## Cryptography
 
 * **Cipher: AES-GCM-SIV** (RFC 8452). Each entry's **name is bound as associated data**, so a ciphertext cannot
   be moved to another slot in the bundle unnoticed.
+* **Whole-bundle manifest.** A tag over the format, cipher, timestamp,
+  version and the digest of every ciphertext is verified before anything is
+  decrypted, so an added, removed, replaced or reordered entry — and any edit
+  to `META` — is rejected up front, as is a wrong key.
 * **Key derivation** (`crypto.derive_key`) — Argon2id with `t=3` iterations,
   `p=4` lanes, `m=2^16 KiB` (64 MiB), producing 64 bytes, then HKDF-SHA3-512
   down to the requested length. The `info` argument (default
@@ -120,9 +149,11 @@ overrides the one declared on the checklist.
   key = crypto.derive_key(passphrase, salt, info=b"my-fleet/v2")
   ```
 
-  Argon2id needs 64 MiB of RAM per derivation — verify the target board can
-  spare it. Store the salt (16 bytes) next to the bundle; it need not be
-  secret, only unique.
+  Argon2id needs 64 MiB of RAM per derivation. A board that cannot spare it
+  may pass `iterations`, `lanes` and `memory_kib` explicitly, accepting
+  weaker resistance to offline guessing — every value must be repeated to
+  re-derive the same key. Store the salt (16 bytes) next to the bundle; it
+  need not be secret, only unique.
 * `encrypt`/`decrypt` take a raw 16/24/32-byte key.
 
 ### Trust model
@@ -136,15 +167,29 @@ A bundle file is **parsed, never executed** (`vault.read_bundle_file` reads
 only the literal `BUNDLE`/`META` assignments via `ast`). Executing it would
 let anyone who can write to the file run code before a single key check.
 
+### Rollback
+
+The manifest proves a bundle is intact, not that it is *current* — an
+attacker can restore an older, genuinely signed bundle. Pass the last version
+the device accepted:
+
+```python
+registry = load_bundle("secure_bundle.py", key, min_version=stored_version)
+stored_version = registry.version      # persist it
+```
+
+Only the file (or module) form carries a manifest; loading a bare dict skips
+both checks and `min_version` then raises error.
+
 ## Authoring rules
 
 `inspect.getsource` captures only the class body, not the module's `import`
 lines. The loader pre-injects `Step`, `Checklist`, `Context`, `OnError`,
-`StepResult`, `ChecklistReport` and the modules `time`, `os`, `json`,
-`struct`, `hashlib`, `hmac`, `binascii`, `math`, `random`. **Anything else
-must be imported inside a method.** Each bundle entry must define exactly one
-`Step` or `Checklist` subclass, and the class must live in a real `.py` file
-(source cannot be read from a REPL).
+`StepResult`, `StepTimeout`, `ChecklistReport` and the modules `time`, `os`,
+`json`, `struct`, `hashlib`, `hmac`, `binascii`, `math`, `random`.
+**Anything else must be imported inside a method.** Each bundle entry must
+define exactly one `Step` or `Checklist` subclass, and the class must live in
+a real `.py` file (source cannot be read from a REPL).
 
 ## Notes
 

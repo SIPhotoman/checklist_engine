@@ -56,11 +56,15 @@ def check_key(key):
     return key
 
 
-def derive_key(passphrase, salt, *, length=KEY_SIZE, info=DEFAULT_INFO):
+def derive_key(passphrase, salt, *, length=KEY_SIZE, info=DEFAULT_INFO,
+               iterations=ARGON2_ITERATIONS, lanes=ARGON2_LANES,
+               memory_kib=ARGON2_MEMORY_KIB):
     """Derive a key from a passphrase with Argon2id, then HKDF-SHA3-512.
 
-    Argon2id runs at t=3 iterations, p=4 lanes and m=64 MiB; check that
-    the target board can spare that much RAM before provisioning.
+    The Argon2id defaults (t=3, p=4, m=64 MiB) suit a single-board
+    computer. A board that cannot spare 64 MiB may lower ``memory_kib``,
+    at the cost of weaker resistance to offline guessing; every parameter
+    used at derivation time must be repeated to re-derive the same key.
 
     :param passphrase: ``str`` or ``bytes`` secret.
     :param salt: at least 8 bytes (:data:`SALT_SIZE` recommended). Need
@@ -68,6 +72,9 @@ def derive_key(passphrase, salt, *, length=KEY_SIZE, info=DEFAULT_INFO):
         same key can be re-derived.
     :param length: key length in bytes.
     :param info: ``str`` or ``bytes`` context binding for the HKDF stage.
+    :param iterations: Argon2id time cost.
+    :param lanes: Argon2id parallelism.
+    :param memory_kib: Argon2id memory cost in KiB, at least ``8 * lanes``.
     """
     if isinstance(passphrase, str):
         passphrase = passphrase.encode("utf-8")
@@ -75,14 +82,20 @@ def derive_key(passphrase, salt, *, length=KEY_SIZE, info=DEFAULT_INFO):
         info = info.encode("utf-8")
     if not isinstance(salt, (bytes, bytearray)) or len(salt) < 8:
         raise ValueError("salt must be at least 8 bytes")
+    if iterations < 1 or lanes < 1:
+        raise ValueError("iterations and lanes must be >= 1")
+    if memory_kib < 8 * lanes:
+        raise ValueError(
+            "memory_kib must be at least 8 * lanes (%d)" % (8 * lanes)
+        )
     salt = bytes(salt)
 
     secret = Argon2id(
         salt=salt,
         length=ARGON2_OUTPUT,
-        iterations=ARGON2_ITERATIONS,
-        lanes=ARGON2_LANES,
-        memory_cost=ARGON2_MEMORY_KIB,
+        iterations=iterations,
+        lanes=lanes,
+        memory_cost=memory_kib,
     ).derive(passphrase)
     return HKDF(
         algorithm=hashes.SHA3_512(),
