@@ -1,197 +1,122 @@
-## 📖 Read this in other languages
+# Checklist Engine 0.3.0
 
-- [Русский](README.ru.md)
-- [English](README.md)
+[Русский](README.ru.md)
 
----
+Checklist Engine compiles trusted Python contract classes into encrypted
+bundles and runs named or inline checklists. The package release is 0.3.0.
+The bundle format is 2. The monotonic release number inside each bundle is
+an independent integer.
 
-# Checklist Engine
+## Run the offline example
 
-Encrypted, executable emergency checklists.
-Contract classes are written as ordinary Python,
-compiled offline into an encrypted bundle, and decrypted one at a time at
-runtime by a device holding the key.
+Install on Python 3.12 or later and choose a fresh output directory.
 
-## Model
+~~~console
+python -m pip install --only-binary=:all: -r requirements.txt
+PYTHONPATH=src python examples/example.py --output demo-run
+~~~
 
-* **Step** (a *contract*) — one atomic action: `run(ctx, **params)`, plus an
-  optional `undo(ctx)`.
-* **Checklist** — an ordered list of `(step_name, params)` pairs.
-* **Context** — a `dict` shared by every step of one run; steps publish
-  outputs into it and read the outputs of earlier steps.
-* **OnError** — the call-time failure policy: `ABORT`, `CONTINUE` or
-  `ROLLBACK`, plus `retries`, `retry_delay` and `step_timeout`.
+In PowerShell use the equivalent environment setting and invocation.
 
-## Files
+~~~powershell
+$env:PYTHONPATH = "src"
+python examples/example.py --output demo-run
+~~~
 
-| File | Role |
-|---|---|
-| `crypto.py` | AES-GCM-SIV, and key derivation (Argon2id → HKDF-SHA3-512) |
-| `contracts.py` | `Step`, `Checklist`, `Context`, `OnError`, result types |
-| `vault.py` | `build_bundle` (offline compiler), `SecureRegistry` (loader) |
-| `engine.py` | `ChecklistRunner` — executes checklists, applies the policy |
-| `example.py` | Example contracts plus a runnable end-to-end demo |
+The example performs a complete offline build, execution, retry, timeout
+and compensation. It writes two separate bundle files and a SQLite state
+database to the new directory. Its transport and session keys are
+simulated.
 
-Install: `pip install -r requirements.txt` (needs `cryptography>=44.0`).
-Run the demo: `python example.py`.
+## Build and load a release
 
-## Lifecycle
+Author a real Python class derived from Step or Checklist. Provide the
+complete mapping of classes to build_bundle, including every step named
+by each checklist. The compiler checks the captured class and declared
+references before publication. Put required imports inside methods.
+Compiled class snippets have the injected contract API, builtins and
+the standard modules listed in vault.py. Class bodies and annotation
+expressions need to be compatible with that namespace. The compiler
+preserves the author's module-level future import for annotations.
 
-**1. Author contracts** as plain Python in one file:
-
-```python
-from contracts import Checklist, Step
-
-class ConnectToServer(Step):
-    name = "connect"
-
-    def run(self, ctx, host="127.0.0.1", port=8443, **_):
-        ctx["link"] = open_socket(host, port)
-        return "connected"
-
-    def undo(self, ctx):
-        ctx.pop("link", None).close()
-
-class SecureDispatch(Checklist):
-    name = "secure_dispatch"
-    steps = [
-        ("connect", {"host": "10.0.0.7", "port": 8443}),
-        ("channel", {}),
-        ("rotate_keys", {"generation": 7}),
-        ("send", {"command": "ARM_SAFE_MODE"}),
-    ]
-```
-
-**2. Compile to an encrypted bundle** (offline, on a trusted machine):
-
-```python
-from vault import build_bundle
-
-build_bundle({"connect": ConnectToServer,
-              "secure_dispatch": SecureDispatch}, key, "secure_bundle.py",
-             version=3)
-```
-
-The result is an importable `.py` file holding `{name: base64_ciphertext}`.
-No source code appears in it. Raise `version` on every release: the device
-refuses anything older. The file is written to a temporary file and renamed
-into place, so an interrupted build never replaces a working bundle with a
-truncated one.
-
-**3. Load and run** on the device:
-
-```python
+~~~python
 from engine import ChecklistRunner
-from vault import load_bundle
-from contracts import OnError
+from vault import SQLiteReleaseState, load_release_bundle
 
-runner = ChecklistRunner(load_bundle("secure_bundle.py", key,
-                                     min_version=3))
-report = runner.run("secure_dispatch",
-                    on_error=OnError(OnError.ROLLBACK, retries=2,
-                                     step_timeout=10))
-print(report.summary())   # secure_dispatch: OK -- 4/4 steps ok in 0.002s
-```
+state = SQLiteReleaseState("private/accepted.sqlite3", "dispatch")
+registry = load_release_bundle("bundles/current.py", key, state=state)
+report = ChecklistRunner(registry).run("secure_dispatch")
+~~~
 
-`runner.run()` also accepts a `Checklist` class or instance, or an inline
-`[(step_name, params), ...]` list. Each entry may be `"name"`, `("name",)`
-or `("name", params)`.
+Set allow_initial=True only for explicit enrolment in trusted state.
+Subsequent loads use the default. The state transaction rejects lower
+versions and conflicting authenticated contents at the same version.
+For an eligible release, it loads every class and checks checklist
+names, default policies, plans and referenced steps before committing.
+For referenced steps it checks synchronous methods and whether an
+inspectable constructor accepts a zero-argument call. Direct
+instantiation supports arguments. Class bodies run with the process's
+privileges while the write transaction is open, including when reloading
+the accepted digest. SQLite can roll back the release record. The host
+manages any external effects of trusted class code.
+Custom release stores implement accept(release, *, prepare), compare
+the release before calling prepare once, and commit after it succeeds.
+Keep the state database and deployment directory under the application's
+control. The host retains accepted bundle files and coordinates which
+registry it activates.
 
-## Execution semantics
+The strict file loader accepts str and PathLike[str]. It parses the
+generated file's literal data and checks the manifest before exposing
+the registry. BundleLimits controls resource budgets. The default
+limits are 1 MiB per file, 4096 entries, 256 UTF-8 bytes per name and
+256 KiB of encoded data per entry. The legacy load_bundle path
+supports min_version and also accepts trusted dict and module inputs.
+Use load_release_bundle for deployed files.
 
-For each step: instantiate the class, call `run(ctx, **params)`; on an
-exception retry up to `retries` more times (sleeping `retry_delay`, same
-instance reused); if it still fails, apply the policy —
+build_bundle creates an exclusive temporary file in the destination
+directory. It syncs the file, replaces the destination and syncs
+directory metadata on POSIX. Simultaneous builders publish complete
+files in replacement order. Release-state admission separately
+controls which versions can run.
 
-* `ABORT` — stop immediately (the default; fail-safe for emergencies).
-* `CONTINUE` — record the failure and move to the next step.
-* `ROLLBACK` — call `undo(ctx)` on completed steps in reverse order, then
-  stop. An exception inside `undo` is recorded but never masks the original
-  failure.
+## Execution
 
-Every attempt lands in a `ChecklistReport` (`.ok`, `.results`,
-`.rolled_back`, `.duration`, `.summary()`). A policy passed to `run()`
-overrides the one declared on the checklist.
+The runner validates the entire plan before the first action. An entry
+can be a name, a one-item sequence or a name-and-parameters pair.
+Parameters become keyword arguments to run. The Context is shared
+within a run.
 
-### Step timeouts
-
-`step_timeout` bounds one *attempt*, not the whole step: with `retries=2` and
-`step_timeout=10` a hung step costs at most 30 s instead of blocking the
-procedure forever. When it fires, `StepTimeout` is raised inside the step and
-counts as an ordinary failed attempt.
-
-Enforcement uses `SIGALRM`, so it only interrupts code running on the main
-thread of a Unix CPython process; elsewhere the runner logs a warning and the
-limit becomes advisory. Write blocking steps to honour it either way:
-
-```python
-def run(self, ctx, **_):
-    sock.settimeout(ctx.time_left())   # None when no timeout is set
-```
-
-A step that catches broad exceptions will swallow `StepTimeout` like any
-other.
+- ABORT stops on failure. CONTINUE proceeds. ROLLBACK runs available
+  compensation for completed steps in reverse order.
+- Set retry_safe=True only for steps whose repeats are safe. A trusted
+  caller can opt into legacy retries with allow_unsafe_retries=True.
+- step_timeout limits a run attempt. step_total_timeout covers one
+  step's loading, construction, attempts and delays. undo_timeout
+  limits each compensation. The policy is copied when a run starts.
+- Context.time_left() supplies the remaining monotonic budget. The
+  engine can borrow a free Unix timer on the main thread. SecureRegistry
+  defers engine interrupts during class lookup. A waiting caller uses its
+  remaining budget, and the loading caller checks expiry at lookup
+  boundaries. A Context deadline also covers lookup of a named checklist.
+  Outside the Unix signal path, steps use cooperative limits.
+  An expired result fails even when a step handled StepTimeout. A hard
+  cut-off for arbitrary blocking code requires process supervision.
+- Reports retain one final outcome per step and the number of actual
+  attempts. Compensation has its own phase and can fail or be skipped.
+  Diagnostic codes help keep contract exception text out of the report.
 
 ## Cryptography
 
-* **Cipher: AES-GCM-SIV** (RFC 8452). Each entry's **name is bound as associated data**, so a ciphertext cannot
-  be moved to another slot in the bundle unnoticed.
-* **Whole-bundle manifest.** A tag over the format, cipher, timestamp,
-  version and the digest of every ciphertext is verified before anything is
-  decrypted, so an added, removed, replaced or reordered entry — and any edit
-  to `META` — is rejected up front, as is a wrong key.
-* **Key derivation** (`crypto.derive_key`) — Argon2id with `t=3` iterations,
-  `p=4` lanes, `m=2^16 KiB` (64 MiB), producing 64 bytes, then HKDF-SHA3-512
-  down to the requested length. The `info` argument (default
-  `b"checklists-engine/v1/bundle-key"`) binds the key to a purpose.
+AES-GCM-SIV encrypts contract source using a random 12-byte nonce.
+The entry name is authenticated as associated data. The format-2
+manifest binds format, cipher, creation time, release number and
+canonical name-to-ciphertext digests. Names are sorted when computing
+the manifest. Published bundles require an AEAD backend that supports
+empty plaintext for the manifest.
 
-  ```python
-  key = crypto.derive_key(passphrase, salt, info=b"my-fleet/v2")
-  ```
-
-  Argon2id needs 64 MiB of RAM per derivation. A board that cannot spare it
-  may pass `iterations`, `lanes` and `memory_kib` explicitly, accepting
-  weaker resistance to offline guessing — every value must be repeated to
-  re-derive the same key. Store the salt (16 bytes) next to the bundle; it
-  need not be secret, only unique.
-* `encrypt`/`decrypt` take a raw 16/24/32-byte key.
-
-### Trust model
-
-The key is the only boundary. Decrypted contract code runs with full
-privileges, like any other module in the process: this gives contracts
-**confidentiality and integrity, not a sandbox**. Anyone who can supply the
-key can run arbitrary code, so protect the key accordingly.
-
-A bundle file is **parsed, never executed** (`vault.read_bundle_file` reads
-only the literal `BUNDLE`/`META` assignments via `ast`). Executing it would
-let anyone who can write to the file run code before a single key check.
-
-### Rollback
-
-The manifest proves a bundle is intact, not that it is *current* — an
-attacker can restore an older, genuinely signed bundle. Pass the last version
-the device accepted:
-
-```python
-registry = load_bundle("secure_bundle.py", key, min_version=stored_version)
-stored_version = registry.version      # persist it
-```
-
-Only the file (or module) form carries a manifest; loading a bare dict skips
-both checks and `min_version` then raises error.
-
-## Authoring rules
-
-`inspect.getsource` captures only the class body, not the module's `import`
-lines. The loader pre-injects `Step`, `Checklist`, `Context`, `OnError`,
-`StepResult`, `StepTimeout`, `ChecklistReport` and the modules `time`, `os`,
-`json`, `struct`, `hashlib`, `hmac`, `binascii`, `math`, `random`.
-**Anything else must be imported inside a method.** Each bundle entry must
-define exactly one `Step` or `Checklist` subclass, and the class must live in
-a real `.py` file (source cannot be read from a REPL).
-
-## Notes
-
-* Decryption is lazy and cached: an entry is decrypted the first time it is
-  requested and the class object is reused afterwards.
+Passwords can be converted using derive_bundle_key or the general
+derive_key function. Argon2id defaults to three passes, four lanes
+and 64 MiB. HKDF-SHA3-512 applies context binding. Keep the unique salt
+and KDF parameters with the release configuration. Use the pinned
+PyCA wheel and verify normal encryption, manifest and KDF operations
+on the target platform.

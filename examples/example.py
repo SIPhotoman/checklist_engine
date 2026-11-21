@@ -1,219 +1,231 @@
-"""Example contract sources plus an end-to-end build-and-run demo.
+"""Build and run an offline example in a fresh output directory."""
 
-This file plays two roles:
+from __future__ import annotations
 
-1. It is the *plaintext source* where an author writes ordinary
-   :class:`~contracts.Step` and :class:`~contracts.Checklist` classes --
-   the input to :func:`vault.build_bundle`.
-2. Its :func:`main` shows the whole lifecycle: encrypt those classes into
-   ``secure_bundle.py``, load them back with the key, and run checklists
-   under different failure policies.
-
-The steps model the contract from the brief: connect -> establish an
-encrypted channel -> rotate keys -> send command. Network and crypto
-calls are SIMULATED so the demo runs offline.
-
-Because only the class body is encrypted, a step may use the pre-injected
-names (``Step``, ``time``, ``hashlib``, ``hmac``, ``os`` ...) directly and
-must ``import`` anything else *inside* a method.
-"""
-
+import argparse
 import hashlib
 import hmac
 import logging
 import os
 import time
+from pathlib import Path
+from typing import cast
 
-from contracts import Checklist, OnError, Step
+from contracts import Checklist, Context, OnError, Step, StepTimeout
 from engine import ChecklistRunner
-from vault import BundleError, build_bundle, load_bundle
+from vault import (
+    BundleError,
+    ReleaseStateError,
+    SQLiteReleaseState,
+    build_bundle,
+    load_bundle,
+    load_release_bundle,
+)
 
-BUNDLE_PATH = "secure_bundle.py"
+CURRENT_VERSION = 3
+PREVIOUS_VERSION = 2
+TEST_KEY_BYTES = 32
 
 
-# Contract sources: these class bodies are what gets encrypted.
 class ConnectToServer(Step):
-    """Open the transport link to the control server."""
+    """Simulate opening a transport to the configured address."""
 
     name = "connect"
 
-    def run(self, ctx, host="127.0.0.1", port=8443, **_):
-        link = {"host": host, "port": port, "open": True}
-        ctx["link"] = link
-        return "connected to %s:%d" % (host, port)
+    def run(self, ctx: Context, **params: object) -> str:
+        """Put the endpoint into the run context."""
+        host = params.get("host", "127.0.0.1")
+        port = params.get("port", 8443)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise TypeError("Expected a host name and integer port")
+        ctx.update({"host": host, "port": port, "link": True})
+        return f"connected to {host}:{port}"
 
-    def undo(self, ctx):
-        link = ctx.pop("link", None)
-        if link:
-            link["open"] = False
+    def undo(self, ctx: Context) -> None:
+        """Close the simulated transport."""
+        for key in ("host", "port", "link"):
+            ctx.pop(key, None)
 
 
 class EstablishEncryptedChannel(Step):
-    """Perform a handshake and derive a session key over the open link."""
+    """Simulate channel establishment without network I/O."""
 
     name = "channel"
 
-    def run(self, ctx, **_):
-        link = ctx.require("link")
-        if not link.get("open"):
-            raise RuntimeError("link is not open")
-        transcript = ("%s:%s" % (link["host"], link["port"])).encode()
-        digest = hashlib.sha256(b"handshake|" + transcript).digest()
-        ctx["session_key"] = digest
+    def run(self, ctx: Context, **_params: object) -> str:
+        """Set the example channel state and a synthetic session key."""
+        if not ctx.get("link"):
+            raise ValueError("The example link is closed")
+        transcript = f"{ctx.require('host')}:{ctx.require('port')}".encode()
+        ctx["session_key"] = hashlib.sha256(
+            b"handshake|" + transcript
+        ).digest()
         ctx["channel_secure"] = True
         return "channel secured"
 
-    def undo(self, ctx):
+    def undo(self, ctx: Context) -> None:
+        """Clear the synthetic channel state."""
         ctx.pop("session_key", None)
-        ctx["channel_secure"] = False
+        ctx.pop("channel_secure", None)
 
 
 class RotateKeys(Step):
-    """Derive a fresh operational key for the requested generation."""
+    """Simulate installing an operational key for one generation."""
 
     name = "rotate_keys"
 
-    def run(self, ctx, generation=0, **_):
-        if not ctx.get("channel_secure"):
-            raise RuntimeError("refusing to rotate keys on insecure channel")
-        if generation < 0:
-            raise ValueError("generation must be non-negative")
-        session_key = ctx.require("session_key")
-        message = b"gen-%d" % generation
-        ctx["op_key"] = hmac.new(session_key, message, hashlib.sha256).digest()
+    def run(self, ctx: Context, **params: object) -> str:
+        """Validate the generation before changing the example state."""
+        generation = params.get("generation", 0)
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+        ):
+            raise ValueError("Expected a nonnegative generation")
+        key = ctx.require("session_key")
+        if not isinstance(key, bytes) or not ctx.get("channel_secure"):
+            raise ValueError("The example channel is unavailable")
+        ctx["op_key"] = hmac.digest(
+            key,
+            f"gen-{generation}".encode("ascii"),
+            "sha256",
+        )
         ctx["key_generation"] = generation
-        return "rotated to generation %d" % generation
+        return f"rotated to generation {generation}"
+
+    def undo(self, ctx: Context) -> None:
+        """Clear the installed example key."""
+        ctx.pop("op_key", None)
+        ctx.pop("key_generation", None)
 
 
 class SendCommand(Step):
-    """Send the emergency command over the secured, keyed channel."""
+    """Simulate a repeatable action that can fail before completing."""
 
     name = "send"
+    retry_safe = True
 
-    def run(self, ctx, command="NOOP", fail_times=0, **_):
-        if not ctx.get("channel_secure"):
-            raise RuntimeError("cannot send on an insecure channel")
+    def run(self, ctx: Context, **params: object) -> dict[str, str]:
+        """Return an acknowledgement after the configured failures."""
         ctx.require("op_key")
-        seen = ctx.get("_send_attempts", 0) + 1
-        ctx["_send_attempts"] = seen
-        if seen <= fail_times:
-            raise IOError("transient send failure #%d" % seen)
+        if not ctx.get("channel_secure"):
+            raise ValueError("The example channel is unavailable")
+        command = params.get("command", "PING")
+        failures = params.get("fail_times", 0)
+        if not isinstance(command, str) or not isinstance(failures, int):
+            raise TypeError("Invalid example action parameters")
+        previous = ctx.get("_send_attempts", 0)
+        if not isinstance(previous, int):
+            raise TypeError("Invalid attempt state")
+        attempts = previous + 1
+        ctx["_send_attempts"] = attempts
+        if attempts <= failures:
+            raise OSError("Simulated transient failure")
         return {"command": command, "status": "acknowledged"}
 
 
-class StallForever(Step):
-    """A step that never returns on its own, to exercise step_timeout."""
+class WaitForDeadline(Step):
+    """Demonstrate a portable bounded wait."""
 
     name = "stall"
 
-    def run(self, ctx, seconds=3600.0, **_):
-        # SIMULATED: a socket read with no timeout of its own.
-        time.sleep(seconds)
-        return "returned on its own"
+    def run(self, ctx: Context, **_params: object) -> str:
+        """Wait a short interval capped by the current deadline."""
+        remaining = ctx.time_left()
+        time.sleep(0.04 if remaining is None else min(0.04, remaining))
+        if ctx.time_left() == 0.0:
+            raise StepTimeout("Example wait expired")
+        return "wait completed"
 
 
 class SecureDispatch(Checklist):
-    """The canonical happy-path emergency procedure."""
+    """Declare the complete simulated sequence."""
 
     name = "secure_dispatch"
-    steps = [
-        ("connect", {"host": "10.0.0.7", "port": 8443}),
+    steps = (
+        ("connect", {"host": "127.0.0.1", "port": 8443}),
         ("channel", {}),
         ("rotate_keys", {"generation": 7}),
-        ("send", {"command": "ARM_SAFE_MODE"}),
-    ]
+        ("send", {"command": "PING"}),
+    )
 
 
-# Handed to build_bundle: both the steps and the checklist get encrypted.
-SOURCES = {
+SOURCES: dict[str, type[Step | Checklist]] = {
     "connect": ConnectToServer,
     "channel": EstablishEncryptedChannel,
     "rotate_keys": RotateKeys,
     "send": SendCommand,
-    "stall": StallForever,
+    "stall": WaitForDeadline,
     "secure_dispatch": SecureDispatch,
 }
 
-BUNDLE_VERSION = 3
 
+def run_demo(directory: Path) -> None:
+    """Publish two bundles and verify the demo outcomes."""
+    directory.mkdir(parents=True)
+    current = directory / "current.py"
+    older = directory / "previous.py"
+    state_path = directory / "accepted.sqlite3"
+    key = os.urandom(TEST_KEY_BYTES)
 
-# Demo driver.
-def main():
-    logging.basicConfig(
-        level=logging.INFO, format="%(levelname)-7s %(message)s"
-    )
-
-    # The key would normally come from a secure element
-    key = os.urandom(32)
-
-    # 1. Offline: encrypt the plaintext classes into an importable bundle
-    build_bundle(SOURCES, key, BUNDLE_PATH, version=BUNDLE_VERSION)
-    print("built encrypted bundle v%d -> %s\n"
-          % (BUNDLE_VERSION, BUNDLE_PATH))
-
-    # 2. Runtime: load it back, refusing anything older than we accepted.
-    registry = load_bundle(BUNDLE_PATH, key, min_version=BUNDLE_VERSION)
+    build_bundle(SOURCES, key, current, version=CURRENT_VERSION)
+    state = SQLiteReleaseState(state_path, "demo", allow_initial=True)
+    registry = load_release_bundle(current, key, state=state)
     runner = ChecklistRunner(registry)
-    print("contracts in bundle:", registry.names(), "\n")
 
-    # 3a. Happy path: default ABORT policy, checklist resolved by name.
-    print("=== run A: happy path (ABORT) ===")
-    report = runner.run("secure_dispatch")
-    print(report.summary(), "\n")
+    good = runner.run("secure_dispatch")
+    if not good.ok:
+        raise RuntimeError("The example checklist should complete")
+    print(good.summary())
 
-    # 3b. Forced failure with ROLLBACK: undo runs in reverse order.
-    print("=== run B: forced failure, ROLLBACK ===")
-    failing = [
-        ("connect", {"host": "10.0.0.7", "port": 8443}),
-        ("channel", {}),
-        ("rotate_keys", {"generation": -1}),  # invalid -> raises
-        ("send", {"command": "ARM_SAFE_MODE"}),
-    ]
-    report = runner.run(failing, on_error=OnError(OnError.ROLLBACK, retries=1))
-    _dump(report)
-
-    # 3c. Transient fault recovered by retries (call-time policy).
-    print("=== run C: flaky send, retries ===")
-    flaky = [
-        ("connect", {}),
-        ("channel", {}),
-        ("rotate_keys", {"generation": 1}),
-        ("send", {"command": "PING", "fail_times": 2}),
-    ]
-    report = runner.run(
-        flaky, on_error=OnError(OnError.ABORT, retries=3, retry_delay=0.0)
+    ctx = Context()
+    rolled_back = runner.run(
+        ["connect", "channel", "rotate_keys", ("send", {"fail_times": 1})],
+        ctx,
+        OnError(OnError.ROLLBACK),
     )
-    _dump(report)
+    if rolled_back.ok or not rolled_back.rolled_back or "op_key" in ctx:
+        raise RuntimeError("The example compensation should clear the key")
+    print(rolled_back.summary())
 
-    # 3d. A blocking step is interrupted instead of stalling the run.
-    print("=== run D: hung step, step_timeout ===")
-    report = runner.run(
-        [("stall", {})],
-        on_error=OnError(OnError.ABORT, retries=1, step_timeout=0.3),
+    retried = runner.run(
+        ["connect", "channel", "rotate_keys", ("send", {"fail_times": 2})],
+        on_error=OnError(retries=2),
     )
-    _dump(report)
+    if not retried.ok:
+        raise RuntimeError("The repeatable example action should recover")
+    print(retried.summary())
 
-    # 3e. The key is the trust boundary, checked before anything decrypts.
-    print("=== run E: wrong key ===")
+    timed = runner.run(["stall"], on_error=OnError(step_timeout=0.01))
+    if timed.ok or timed.results[0].error != "StepTimeout":
+        raise RuntimeError("The example wait should time out")
+    print(timed.summary())
+
     try:
-        load_bundle(BUNDLE_PATH, key=os.urandom(32))
-    except BundleError as exc:
-        print("   refused at load time: %s\n" % exc)
+        load_bundle(current, os.urandom(TEST_KEY_BYTES))
+    except BundleError:
+        print("The wrong key was rejected")
+    else:
+        raise RuntimeError("The example accepted an unrelated key")
 
-    # 3f. An older bundle cannot be put back once v3 has been accepted.
-    print("=== run F: rollback refused ===")
-    build_bundle(SOURCES, key, BUNDLE_PATH, version=BUNDLE_VERSION - 1)
+    build_bundle(SOURCES, key, older, version=PREVIOUS_VERSION)
+    enrolled = SQLiteReleaseState(state_path, "demo")
     try:
-        load_bundle(BUNDLE_PATH, key, min_version=BUNDLE_VERSION)
-    except BundleError as exc:
-        print("   refused at load time: %s" % exc)
+        load_release_bundle(older, key, state=enrolled)
+    except ReleaseStateError:
+        print("The older release was rejected")
+    else:
+        raise RuntimeError("The example accepted an older release")
 
 
-def _dump(report):
-    print(report.summary())
-    for result in report.results:
-        print("   ", result)
-    print()
+def main() -> None:
+    """Parse the output directory for the offline demonstration."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    arguments = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING)
+    run_demo(cast("Path", arguments.output))
 
 
 if __name__ == "__main__":

@@ -1,267 +1,412 @@
-"""Core vocabulary shared by contract authors and the execution engine.
+"""Public vocabulary for synchronous checklist contracts."""
 
-These are the only names a step author needs. They are also pre-injected
-into the namespace where a decrypted class is executed (see :mod:`vault`),
-so step code can use ``Step``, ``Context`` and friends without importing.
+from __future__ import annotations
 
-* **Step / contract** -- one atomic action.
-* **Checklist** -- an ordered plan of steps.
-* **Context** -- shared state threaded through one run.
-* **OnError** -- what to do when a step fails, and how long to wait.
-"""
-
+import inspect
+import sys
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from threading import TIMEOUT_MAX, local
+from typing import ClassVar, Literal, TypeGuard, cast
 
 __all__ = [
-    "Context",
-    "Step",
     "Checklist",
+    "ChecklistReport",
+    "Context",
     "OnError",
+    "Step",
+    "StepPlan",
     "StepResult",
     "StepTimeout",
-    "ChecklistReport",
 ]
 
-
-class StepTimeout(Exception):
-    """Raised inside a step whose attempt outran ``OnError.step_timeout``.
-
-    The engine treats it as an ordinary step failure, so retries and the
-    failure policy apply. A step that swallows broad exceptions will
-    swallow this one too.
-    """
+type StepEntry = (str | tuple[str] | tuple[str, Mapping[str, object] | None])
+type StepPlan = list[StepEntry] | tuple[StepEntry, ...]
+type Phase = Literal["run", "undo"]
+_PAIR_SIZE = 2
 
 
-class Context(dict):
-    """Mutable state shared by every step in a single checklist run.
+class StepTimeout(Exception):  # noqa: N818 - Retain the public name.
+    """Signal that an attempt or its enclosing budget expired."""
 
-    A step publishes outputs here and reads inputs produced by earlier
-    steps: ``ctx["channel"] = sock`` in one, ``ctx.require("channel")`` in
-    the next. A plain ``dict`` subclass, so step code stays portable.
 
-    :attr:`deadline` is set by the engine around each step attempt; read
-    it through :meth:`time_left` rather than directly.
-    """
+class _ExecutionBudget(local):
+    """Share the active engine deadline with the registry."""
 
-    deadline = None
+    deadline: float | None = None
+    deferred: bool = False
 
-    def require(self, key):
-        """Return ``self[key]``, or raise a clear error if it is missing."""
-        if key not in self:
-            raise KeyError(
-                "required context key %r was not set by a prior step" % key
-            )
-        return self[key]
+    @contextmanager
+    def defer_interrupts(self) -> Iterator[None]:
+        previous = self.deferred
+        try:
+            self.deferred = True
+            yield
+        finally:
+            self.deferred = previous
 
-    def time_left(self):
-        """Seconds until the current step attempt times out, or ``None``.
-
-        A blocking step should pass this to whatever it waits on -- a
-        socket timeout, a poll interval -- because signal-based
-        enforcement is unavailable off the main thread and on Windows.
-        """
-        if self.deadline is None:
+    def remaining(self) -> float | None:
+        deadline = self.deadline
+        if deadline is None:
             return None
-        return max(0.0, self.deadline - time.time())
+        seconds = deadline - time.monotonic()
+        if not seconds > 0:
+            raise StepTimeout("The execution budget expired")
+        return seconds
+
+
+_execution_budget = _ExecutionBudget()
+
+
+def earlier(
+    current: float | None,
+    requested: float | None,
+) -> float | None:
+    """Choose the earliest deadline, treating None as unlimited."""
+    if current is None:
+        return requested
+    if requested is None:
+        return current
+    return min(current, requested)
+
+
+def is_class(value: object) -> TypeGuard[type[object]]:
+    """Narrow a dynamic value to a Python class."""
+    return isinstance(value, cast("type[object]", type))
+
+
+def _is_synchronous_method(method: object) -> bool:
+    return not (
+        inspect.iscoroutinefunction(method)
+        or inspect.isasyncgenfunction(method)
+    )
+
+
+class Context(dict[str, object]):
+    """Keep shared state and the active deadline for one run."""
+
+    deadline: float | None = None
+    _monotonic_deadline: float | None = None
+
+    def require(self, key: str) -> object:
+        """Return a required value with a clear missing-key error."""
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Required context key {key!r} was not set"
+            ) from exc
+
+    def time_left(self) -> float | None:
+        """Return the remaining time in seconds, or None."""
+        if self._monotonic_deadline is not None:
+            return max(0.0, self._monotonic_deadline - time.monotonic())
+        if self.deadline is not None:
+            return max(0.0, self.deadline - time.time())
+        return None
+
+    @contextmanager
+    def limit(self, deadline: float | None) -> Iterator[float | None]:
+        """Apply the earlier deadline, then restore prior state."""
+        previous = self._monotonic_deadline
+        previous_wall = self.deadline
+        inherited = previous
+        if inherited is None and previous_wall is not None:
+            inherited = time.monotonic() + (previous_wall - time.time())
+        effective = earlier(inherited, deadline)
+        try:
+            self._monotonic_deadline = effective
+            if effective is not None and effective != previous:
+                self.deadline = time.time() + (effective - time.monotonic())
+            yield effective
+        finally:
+            self._monotonic_deadline = previous
+            self.deadline = previous_wall
 
 
 class Step:
-    """Base class for a single checklist item ("contract").
+    """Implement a synchronous action and an optional compensation."""
 
-    Subclasses implement :meth:`run` and, optionally, :meth:`undo`. All
-    data a step needs arrives as keyword arguments, so the instance stays
-    stateless and reusable across runs.
-    """
+    name: ClassVar[str | None] = None
+    retry_safe: ClassVar[bool] = False
 
-    name = None
-
-    def run(self, ctx, **params):
-        """Perform the action; the return value is stored in the report.
-
-        Raise an exception to signal failure -- the engine then applies the
-        active :class:`OnError` policy.
-
-        :param ctx: the shared :class:`Context` for this run.
-        :param params: parameters declared for this step in the checklist.
-        """
+    def run(self, ctx: Context, **params: object) -> object:
+        """Perform the action and return its result."""
         raise NotImplementedError
 
-    def undo(self, ctx):
-        """Best-effort rollback of a previously *successful* :meth:`run`.
-
-        Called in reverse order under the ``ROLLBACK`` policy only. The
-        default is a no-op. Exceptions raised here are recorded but never
-        mask the original failure.
-        """
-        return None
+    def undo(self, ctx: Context) -> None:
+        """Compensate for a completed action when overridden."""
 
     @classmethod
-    def display_name(cls):
-        """Return :attr:`name` if set, else the class name."""
+    def display_name(cls) -> str:
+        """Return the configured name or the class name."""
         return cls.name or cls.__name__
 
 
 class Checklist:
-    """An ordered emergency procedure: a named list of steps to execute.
+    """Declare ordered steps and an optional default failure policy."""
 
-    Subclass it and set :attr:`steps` to ``(step_name, params)`` pairs,
-    where ``step_name`` refers to a :class:`Step` in the same bundle and
-    ``params`` becomes keyword arguments to its :meth:`Step.run`. An
-    :attr:`on_error` set here is a default; a policy passed to the runner
-    at call time always wins.
-
-    Example::
-
-        class SecureDispatch(Checklist):
-            name = "secure_dispatch"
-            steps = [
-                ("connect", {"host": "10.0.0.1", "port": 8443}),
-                ("channel", {}),
-                ("rotate_keys", {"generation": 7}),
-                ("send", {"command": "ABORT_ALL"}),
-            ]
-            on_error = OnError(OnError.ROLLBACK, retries=2)
-    """
-
-    name = None
-    steps = ()  # a tuple, so subclasses cannot mutate a shared default
-    on_error = None
+    name: ClassVar[str | None] = None
+    steps: ClassVar[StepPlan] = ()
+    on_error: ClassVar[OnError | None] = None
 
     @classmethod
-    def display_name(cls):
-        """Return :attr:`name` if set, else the class name."""
+    def display_name(cls) -> str:
+        """Return the configured name or the class name."""
         return cls.name or cls.__name__
 
 
-class OnError:
-    """Failure-handling policy for one checklist run.
+def _checklist_name(checklist: Checklist | type[Checklist]) -> str:
+    name = checklist.display_name()
+    if not isinstance(name, str) or not name:
+        raise TypeError("The checklist name must be a nonempty string")
+    return str.__str__(name)
 
-    Retries come first and are orthogonal to the policy: a step is tried up
-    to ``1 + retries`` times before it counts as failed. Only then does
-    :attr:`policy` decide the fate of the rest of the run.
-    """
 
-    #: Stop at the first failed step (fail-safe default for emergencies).
-    ABORT = "abort"
-    #: Log the failure and continue with the next step.
-    CONTINUE = "continue"
-    #: Undo completed steps in reverse order, then stop.
-    ROLLBACK = "rollback"
+def _is_sequence(
+    value: object,
+) -> TypeGuard[list[object] | tuple[object, ...]]:
+    return isinstance(value, (list, tuple))
 
-    POLICIES = (ABORT, CONTINUE, ROLLBACK)
 
-    def __init__(self, policy=ABORT, retries=0, retry_delay=0.0,
-                 step_timeout=None):
-        """:param policy: one of :attr:`ABORT`, :attr:`CONTINUE`,
-            :attr:`ROLLBACK`.
-        :param retries: extra attempts per step before it is deemed failed.
-        :param retry_delay: seconds to sleep between attempts.
-        :param step_timeout: seconds one *attempt* may run before
-            :class:`StepTimeout` is raised inside it; ``None`` waits
-            forever. The budget is per attempt, not per step.
-        """
-        if policy not in self.POLICIES:
-            raise ValueError("unknown failure policy: %r" % (policy,))
-        if retries < 0:
-            raise ValueError("retries must be >= 0")
-        if retry_delay < 0:
-            raise ValueError("retry_delay must be >= 0")
-        if step_timeout is not None and step_timeout <= 0:
-            raise ValueError("step_timeout must be > 0 or None")
-        self.policy = policy
-        self.retries = retries
-        self.retry_delay = retry_delay
-        self.step_timeout = step_timeout
+def _is_mapping(value: object) -> TypeGuard[Mapping[object, object]]:
+    return isinstance(value, Mapping) or (
+        callable(cast("object", getattr(value, "keys", None)))
+        and callable(cast("object", getattr(value, "__getitem__", None)))
+    )
 
-    def __repr__(self):
-        return (
-            "OnError(policy=%r, retries=%d, retry_delay=%s, "
-            "step_timeout=%s)" % (
-                self.policy,
-                self.retries,
-                self.retry_delay,
-                self.step_timeout,
+
+def normalise_steps(steps: object) -> list[tuple[str, dict[str, object]]]:
+    """Validate and copy an entire plan before executing a step."""
+    if not _is_sequence(steps):
+        raise TypeError("Checklist steps must be a list or tuple")
+
+    normalised: list[tuple[str, dict[str, object]]] = []
+    for position, entry in enumerate(steps, start=1):
+        name: object
+        params: object = None
+        if isinstance(entry, str):
+            name = entry
+        elif _is_sequence(entry) and len(entry) in (1, _PAIR_SIZE):
+            name = entry[0]
+            if len(entry) == _PAIR_SIZE:
+                params = entry[1]
+        else:
+            raise TypeError(f"Invalid checklist entry at position {position}")
+
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"Step name at position {position} must be nonempty"
             )
+        normalised.append((str.__str__(name), _arguments(params, position)))
+    return normalised
+
+
+def _arguments(params: object, position: int) -> dict[str, object]:
+    arguments: dict[str, object] = {}
+    if params is None:
+        return arguments
+    if not _is_mapping(params):
+        raise TypeError(f"Parameters for step {position} must be a mapping")
+    for key in params.keys():  # noqa: SIM118 - Support the keys() protocol.
+        if not isinstance(key, str) or key in {"ctx", "self"}:
+            raise TypeError(f"Invalid parameter name for step {position}")
+        arguments[str.__str__(key)] = params[key]
+    return arguments
+
+
+def _seconds(value: object, *, allow_zero: bool) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not 0 <= value <= TIMEOUT_MAX
+        or (value == 0 and not allow_zero)
+    ):
+        raise ValueError("Timeouts and delays must be finite in-range numbers")
+    return float(value)
+
+
+class OnError:
+    """Configure failure policy, retry eligibility and time budgets."""
+
+    ABORT: ClassVar[str] = "abort"
+    CONTINUE: ClassVar[str] = "continue"
+    ROLLBACK: ClassVar[str] = "rollback"
+    POLICIES: ClassVar[tuple[str, ...]] = (ABORT, CONTINUE, ROLLBACK)
+
+    def __init__(  # noqa: PLR0913 - Preserve the public policy options.
+        self,
+        policy: str = ABORT,
+        retries: int = 0,
+        retry_delay: float = 0.0,
+        step_timeout: float | None = None,
+        *,
+        step_total_timeout: float | None = None,
+        undo_timeout: float | None = None,
+        allow_unsafe_retries: bool = False,
+    ) -> None:
+        """Validate options for a run or a reusable checklist."""
+        if policy not in self.POLICIES:
+            raise ValueError("Unknown failure policy")
+        if (
+            not isinstance(retries, int)
+            or isinstance(retries, bool)
+            or not 0 <= retries < sys.maxsize
+        ):
+            raise ValueError("Retries must be a nonnegative in-range integer")
+        if not isinstance(allow_unsafe_retries, bool):
+            raise TypeError("allow_unsafe_retries must be bool")
+        self.policy = str.__str__(policy)
+        self.retries = int(retries)
+        self.retry_delay = _seconds(retry_delay, allow_zero=True)
+        self.step_timeout = self._timeout(step_timeout)
+        self.step_total_timeout = self._timeout(step_total_timeout)
+        self.undo_timeout = self._timeout(undo_timeout)
+        self.allow_unsafe_retries = allow_unsafe_retries
+
+    @staticmethod
+    def _timeout(value: object) -> float | None:
+        return None if value is None else _seconds(value, allow_zero=False)
+
+    def __repr__(self) -> str:
+        """Describe the effective retry and timeout configuration."""
+        return (
+            f"OnError(policy={self.policy!r}, retries={self.retries}, "
+            f"retry_delay={self.retry_delay}, "
+            f"step_timeout={self.step_timeout}, "
+            f"step_total_timeout={self.step_total_timeout}, "
+            f"undo_timeout={self.undo_timeout}, "
+            f"allow_unsafe_retries={self.allow_unsafe_retries})"
         )
 
 
+def _snapshot_policy(policy: OnError | None) -> OnError:
+    if policy is None:
+        return OnError()
+    if not isinstance(policy, OnError):
+        raise TypeError("The failure policy must be an OnError instance")
+    return OnError(
+        policy.policy,
+        policy.retries,
+        policy.retry_delay,
+        policy.step_timeout,
+        step_total_timeout=policy.step_total_timeout,
+        undo_timeout=policy.undo_timeout,
+        allow_unsafe_retries=policy.allow_unsafe_retries,
+    )
+
+
 class StepResult:
-    """Outcome of a single step within a run.
+    """Record a final step or compensation outcome and attempt count."""
 
-    :attr:`error` holds the *text* of the exception, not the exception
-    object, so a report stays safe to log or serialise.
-    """
+    OK: ClassVar[str] = "ok"
+    FAILED: ClassVar[str] = "failed"
+    ROLLED_BACK: ClassVar[str] = "rolled_back"
+    SKIPPED: ClassVar[str] = "skipped"
 
-    OK = "ok"
-    FAILED = "failed"
-    ROLLED_BACK = "rolled_back"
-
-    def __init__(self, name, status, value=None, error=None, attempts=1,
-                 duration=0.0):
+    def __init__(  # noqa: PLR0913, PLR0917 - Preserve the positional API.
+        self,
+        name: str,
+        status: str,
+        value: object = None,
+        error: str | None = None,
+        attempts: int = 1,
+        duration: float = 0.0,
+        *,
+        phase: Phase | None = None,
+        prior_error: str | None = None,
+    ) -> None:
+        """Store an outcome with a diagnostic code in error."""
         self.name = name
         self.status = status
         self.value = value
         self.error = error
         self.attempts = attempts
         self.duration = duration
+        self.prior_error = prior_error
+        if phase is None:
+            phase = (
+                "undo" if status in (self.ROLLED_BACK, self.SKIPPED) else "run"
+            )
+        self.phase: Phase = phase
 
     @property
-    def ok(self):
+    def ok(self) -> bool:
+        """Return whether this result is a successful run."""
         return self.status == self.OK
 
-    def __repr__(self):
-        return "StepResult(name=%r, status=%r, attempts=%d, error=%r)" % (
-            self.name,
-            self.status,
-            self.attempts,
-            self.error,
+    def __repr__(self) -> str:
+        """Describe the status, phase and attempt count."""
+        return (
+            f"StepResult(name={self.name!r}, status={self.status!r}, "
+            f"phase={self.phase!r}, attempts={self.attempts}, "
+            f"error={self.error!r})"
         )
 
 
 class ChecklistReport:
-    """Aggregated outcome of a whole checklist run."""
+    """Collect run and compensation results in execution order."""
 
-    def __init__(self, checklist_name):
+    def __init__(self, checklist_name: str) -> None:
+        """Start a report with calendar and monotonic timestamps."""
         self.checklist_name = checklist_name
-        self.results = []  # StepResult objects, in execution order
+        self.results: list[StepResult] = []
         self.ok = True
+        self.rollback_requested = False
         self.rolled_back = False
         self.started_at = time.time()
-        self.finished_at = None
+        self.finished_at: float | None = None
+        self._started = time.monotonic()
+        self._finished: float | None = None
 
-    def record(self, result):
+    def record(self, result: StepResult) -> None:
+        """Append an outcome and update the aggregate flags."""
         self.results.append(result)
-        if not result.ok:
+        if result.status == StepResult.FAILED:
             self.ok = False
+        if result.status == StepResult.ROLLED_BACK:
+            self.rolled_back = True
 
-    def finish(self):
+    def finish(self) -> ChecklistReport:
+        """Capture the finish times and return the report."""
         self.finished_at = time.time()
+        self._finished = time.monotonic()
         return self
 
     @property
-    def duration(self):
-        end = self.finished_at if self.finished_at is not None else time.time()
-        return end - self.started_at
+    def duration(self) -> float:
+        """Return elapsed monotonic seconds."""
+        end = (
+            self._finished if self._finished is not None else time.monotonic()
+        )
+        return end - self._started
 
-    def summary(self):
-        """Return a short status line.
-
-        Rollback entries are counted separately, so the ``n/m`` figure
-        always refers to steps that were actually executed.
-        """
-        executed = [r for r in self.results
-                    if r.status != StepResult.ROLLED_BACK]
-        undone = len(self.results) - len(executed)
-        passed = sum(1 for r in executed if r.ok)
-        tail = " (%d rolled back)" % undone if self.rolled_back else ""
-        return "%s: %s -- %d/%d steps ok in %.3fs%s" % (
-            self.checklist_name,
-            "OK" if self.ok else "FAILED",
-            passed,
-            len(executed),
-            self.duration,
-            tail,
+    def summary(self) -> str:
+        """Summarise run outcomes and compensation counts."""
+        executed = passed = undone = undo_failed = undo_skipped = 0
+        for result in self.results:
+            if result.phase == "run":
+                executed += 1
+                passed += result.ok
+            elif result.status == StepResult.ROLLED_BACK:
+                undone += 1
+            elif result.status == StepResult.SKIPPED:
+                undo_skipped += 1
+            else:
+                undo_failed += 1
+        tail = ""
+        if self.rollback_requested or undone or undo_failed or undo_skipped:
+            tail = (
+                f" ({undone} rolled back, {undo_failed} failed, "
+                f"{undo_skipped} skipped)"
+            )
+        status = "OK" if self.ok else "FAILED"
+        return (
+            f"{self.checklist_name}: {status} -- {passed}/{executed} "
+            f"steps ok in {self.duration:.3f}s{tail}"
         )
 
-    def __repr__(self):
-        return "ChecklistReport(%s)" % self.summary()
+    def __repr__(self) -> str:
+        """Describe the report with its current summary."""
+        return f"ChecklistReport({self.summary()})"

@@ -1,15 +1,6 @@
-"""Authenticated encryption and key derivation for the checklist engine.
+"""Authenticated encryption and key derivation for format 2."""
 
-Contracts are protected with AES-GCM-SIV (RFC 8452): an authenticated
-cipher that also tolerates nonce reuse, which matters on boards without a
-dependable random source. Tampering is detected at decryption time and
-reported as ``InvalidTag``.
-
-:func:`derive_key` turns a passphrase into a key in two stages -- Argon2id
-to absorb the cost of guessing, then HKDF-SHA3-512 to bind the result to a
-purpose.
-:func:`encrypt` and :func:`decrypt` take an already-derived raw key.
-"""
+from __future__ import annotations
 
 import os
 
@@ -20,112 +11,148 @@ from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 NONCE_SIZE = 12
+TAG_SIZE = 16
+MESSAGE_OVERHEAD = NONCE_SIZE + TAG_SIZE
 KEY_SIZE = 32
 VALID_KEY_SIZES = (16, 24, 32)
 SALT_SIZE = 16
+_MIN_SALT_SIZE = 8
 
 ARGON2_ITERATIONS = 3
 ARGON2_LANES = 4
-ARGON2_MEMORY_KIB = 2 ** 16
+ARGON2_MEMORY_KIB = 2**16
 ARGON2_OUTPUT = 64
-
-# Domain separator for the HKDF stage
+MAX_KDF_LENGTH = 255 * hashes.SHA3_512.digest_size
+MAX_KDF_ITERATIONS = 10
+MAX_KDF_LANES = 16
+MAX_KDF_MEMORY_KIB = 2**18
 DEFAULT_INFO = b"checklists-engine/v1/bundle-key"
 
+type Buffer = bytes | bytearray | memoryview
+
 __all__ = [
-    "NONCE_SIZE",
-    "KEY_SIZE",
-    "VALID_KEY_SIZES",
-    "SALT_SIZE",
     "DEFAULT_INFO",
+    "KEY_SIZE",
+    "MESSAGE_OVERHEAD",
+    "NONCE_SIZE",
+    "SALT_SIZE",
+    "TAG_SIZE",
+    "VALID_KEY_SIZES",
     "InvalidTag",
     "check_key",
+    "decrypt",
+    "derive_bundle_key",
     "derive_key",
     "encrypt",
-    "decrypt",
 ]
 
 
-def check_key(key):
-    """Return ``key`` as bytes, raising ``ValueError`` if it is unusable."""
+def check_key(key: object) -> bytes:
+    """Normalise a supported AES key and reject other lengths."""
     if not isinstance(key, (bytes, bytearray, memoryview)):
-        raise ValueError("key must be bytes, got %s" % type(key).__name__)
-    key = bytes(key)
-    if len(key) not in VALID_KEY_SIZES:
-        raise ValueError("key must be 16, 24 or 32 bytes, got %d" % len(key))
-    return key
+        raise ValueError("Key must be a bytes-like object")  # noqa: TRY004
+    size = key.nbytes if isinstance(key, memoryview) else len(key)
+    if size not in VALID_KEY_SIZES:
+        raise ValueError("Key must be 16, 24 or 32 bytes")
+    raw = bytes(key)
+    if len(raw) not in VALID_KEY_SIZES:
+        raise ValueError("Key length changed during conversion")
+    return raw
 
 
-def derive_key(passphrase, salt, *, length=KEY_SIZE, info=DEFAULT_INFO,
-               iterations=ARGON2_ITERATIONS, lanes=ARGON2_LANES,
-               memory_kib=ARGON2_MEMORY_KIB):
-    """Derive a key from a passphrase with Argon2id, then HKDF-SHA3-512.
+def _utf8(value: object) -> bytes:
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, bytes):
+        return value
+    raise TypeError("Passphrase and context must be str or bytes")
 
-    The Argon2id defaults (t=3, p=4, m=64 MiB) suit a single-board
-    computer. A board that cannot spare 64 MiB may lower ``memory_kib``,
-    at the cost of weaker resistance to offline guessing; every parameter
-    used at derivation time must be repeated to re-derive the same key.
 
-    :param passphrase: ``str`` or ``bytes`` secret.
-    :param salt: at least 8 bytes (:data:`SALT_SIZE` recommended). Need
-        not be secret, only unique; store it next to the bundle so the
-        same key can be re-derived.
-    :param length: key length in bytes.
-    :param info: ``str`` or ``bytes`` context binding for the HKDF stage.
-    :param iterations: Argon2id time cost.
-    :param lanes: Argon2id parallelism.
-    :param memory_kib: Argon2id memory cost in KiB, at least ``8 * lanes``.
-    """
-    if isinstance(passphrase, str):
-        passphrase = passphrase.encode("utf-8")
-    if isinstance(info, str):
-        info = info.encode("utf-8")
-    if not isinstance(salt, (bytes, bytearray)) or len(salt) < 8:
-        raise ValueError("salt must be at least 8 bytes")
-    if iterations < 1 or lanes < 1:
-        raise ValueError("iterations and lanes must be >= 1")
-    if memory_kib < 8 * lanes:
-        raise ValueError(
-            "memory_kib must be at least 8 * lanes (%d)" % (8 * lanes)
-        )
-    salt = bytes(salt)
+def _check_integer(value: object, lower: int, upper: int, name: str) -> None:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not lower <= value <= upper
+    ):
+        raise ValueError(f"{name} must be an integer in [{lower}, {upper}]")
 
+
+def derive_key(  # noqa: PLR0913 - Preserve explicit legacy KDF settings.
+    passphrase: str | bytes,
+    salt: bytes | bytearray,
+    *,
+    length: int = KEY_SIZE,
+    info: str | bytes = DEFAULT_INFO,
+    iterations: int = ARGON2_ITERATIONS,
+    lanes: int = ARGON2_LANES,
+    memory_kib: int = ARGON2_MEMORY_KIB,
+) -> bytes:
+    """Derive an arbitrary-length output using Argon2id and HKDF."""
+    _check_integer(length, 0, MAX_KDF_LENGTH, "length")
+    _check_integer(iterations, 1, MAX_KDF_ITERATIONS, "iterations")
+    _check_integer(lanes, 1, MAX_KDF_LANES, "lanes")
+    _check_integer(memory_kib, 8 * lanes, MAX_KDF_MEMORY_KIB, "memory_kib")
+    if not isinstance(salt, (bytes, bytearray)) or len(salt) < _MIN_SALT_SIZE:
+        raise ValueError("Salt must contain at least eight bytes")
+
+    password = _utf8(passphrase)
+    context = _utf8(info)
+    raw_salt = bytes(salt)
     secret = Argon2id(
-        salt=salt,
+        salt=raw_salt,
         length=ARGON2_OUTPUT,
         iterations=iterations,
         lanes=lanes,
         memory_cost=memory_kib,
-    ).derive(passphrase)
+    ).derive(password)
     return HKDF(
         algorithm=hashes.SHA3_512(),
         length=length,
-        salt=salt,
-        info=info,
+        salt=raw_salt,
+        info=context,
     ).derive(secret)
 
 
-def encrypt(key, plaintext, aad=None):
-    """Encrypt ``plaintext``; return ``nonce || ciphertext``.
+def derive_bundle_key(  # noqa: PLR0913 - Match derive_key's parameters.
+    passphrase: str | bytes,
+    salt: bytes | bytearray,
+    *,
+    length: int = KEY_SIZE,
+    info: str | bytes = DEFAULT_INFO,
+    iterations: int = ARGON2_ITERATIONS,
+    lanes: int = ARGON2_LANES,
+    memory_kib: int = ARGON2_MEMORY_KIB,
+) -> bytes:
+    """Derive a supported AES key from validated KDF parameters."""
+    if type(length) is not int or length not in VALID_KEY_SIZES:
+        raise ValueError("Bundle key length must be 16, 24 or 32 bytes")
+    return derive_key(
+        passphrase,
+        salt,
+        length=length,
+        info=info,
+        iterations=iterations,
+        lanes=lanes,
+        memory_kib=memory_kib,
+    )
 
-    :param aad: associated data -- authenticated but not encrypted. The
-        vault binds each entry's name here so a ciphertext cannot be moved
-        to another slot in the bundle unnoticed.
-    """
+
+def encrypt(
+    key: Buffer, plaintext: Buffer, aad: Buffer | None = None
+) -> bytes:
+    """Return a fresh nonce followed by ciphertext and its tag."""
     aead = AESGCMSIV(check_key(key))
     nonce = os.urandom(NONCE_SIZE)
     return nonce + aead.encrypt(nonce, plaintext, aad)
 
 
-def decrypt(key, blob, aad=None):
-    """Reverse :func:`encrypt`.
-
-    :param blob: ``nonce || ciphertext`` produced by :func:`encrypt`.
-    :param aad: must match the value used at encryption time.
-    :raises InvalidTag: wrong key or tampered data.
-    :raises ValueError: blob too short, or unusable key.
-    """
-    aead = AESGCMSIV(check_key(key))
-    if len(blob) < NONCE_SIZE:
-        raise ValueError("ciphertext blob is shorter than the nonce")
-    return aead.decrypt(blob[:NONCE_SIZE], blob[NONCE_SIZE:], aad)
+def decrypt(key: Buffer, blob: Buffer, aad: Buffer | None = None) -> bytes:
+    """Return verified plaintext and reject truncated inputs early."""
+    raw_key = check_key(key)
+    payload = bytes(blob)
+    if len(payload) < NONCE_SIZE:
+        raise ValueError("Ciphertext is shorter than its nonce")
+    if len(payload) < MESSAGE_OVERHEAD:
+        raise InvalidTag
+    aead = AESGCMSIV(raw_key)
+    return aead.decrypt(payload[:NONCE_SIZE], payload[NONCE_SIZE:], aad)
